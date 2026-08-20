@@ -6,7 +6,7 @@ local function moveToDestination(target: Vector3)
     local start, currentTarget = os.clock(), target
     print(string.format("[Path] Starting search for (%.1f, %.1f, %.1f)", target.X, target.Y, target.Z))
 
-    while os.clock() - start < 10 do
+    while os.clock() - start < 30 do
         local ok, err = pcall(function() path:ComputeAsync(r.Position, currentTarget) end)
         if ok and path.Status == Enum.PathStatus.Success then break end
         warn(string.format("[Path] Compute failed (%s) | Distance: %.1f studs. Bisecting...", err or path.Status.Name, (r.Position - currentTarget).Magnitude))
