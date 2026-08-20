@@ -1,43 +1,120 @@
-local P, V, p = game:GetService("PathfindingService"), game:GetService("VirtualInputManager"), game:GetService("Players").LocalPlayer
-local c, h, r = p.Character or p.CharacterAdded:Wait(), p.Character:WaitForChild("Humanoid"), p.Character:WaitForChild("HumanoidRootPart")
-local path = P:CreatePath({AgentRadius = 2, AgentHeight = 8, AgentCanJump = true, AgentJumpHeight = 7, Costs = {Water = 1000}})
+local P = game:GetService("PathfindingService")
+local V = game:GetService("VirtualInputManager")
+local Players = game:GetService("Players")
 
-local function moveToDestination(target: Vector3)
-    local start, currentTarget = os.clock(), target
-    print(string.format("[Path] Starting search for (%.1f, %.1f, %.1f)", target.X, target.Y, target.Z))
+local p = Players.LocalPlayer
+local c = p.Character or p.CharacterAdded:Wait()
+local h = c:WaitForChild("Humanoid") :: Humanoid
+local r = c:WaitForChild("HumanoidRootPart") :: BasePart
 
-    while os.clock() - start < 30 do
-        local ok, err = pcall(function() path:ComputeAsync(r.Position, currentTarget) end)
-        if ok and path.Status == Enum.PathStatus.Success then break end
-        warn(string.format("[Path] Compute failed (%s) | Distance: %.1f studs. Bisecting...", err or path.Status.Name, (r.Position - currentTarget).Magnitude))
-        currentTarget = r.Position:Lerp(currentTarget, 0.5)
-        task.wait(0.1)
+local MAX_CHUNK_DISTANCE = 1000
+
+local path = P:CreatePath({
+    AgentRadius = 2,
+    AgentHeight = 8,
+    AgentCanJump = true,
+    AgentJumpHeight = 7,
+    Costs = { Water = 1000 }
+})
+
+-- Navigates a single path segment without distance chunking
+local function navigateSegment(startPos: Vector3, targetPos: Vector3, attempt: number): boolean
+    attempt = attempt or 1
+    if attempt > 3 then
+        warn(string.format("[Path] Max retry attempts reached for target %s", tostring(targetPos)))
+        return false
     end
 
-    if path.Status ~= Enum.PathStatus.Success then return warn(string.format("[Path] Timed out after %.1fs. Target unreachable.", os.clock() - start)) end
-    
+    print(string.format("[Path] Computing segment (Attempt %d): %s -> %s", attempt, tostring(startPos), tostring(targetPos)))
+
+    local ok, err = pcall(function() path:ComputeAsync(startPos, targetPos) end)
+    if not ok then
+        warn("[Path] ComputeAsync error:", err)
+        return false
+    end
+
+    if path.Status ~= Enum.PathStatus.Success then
+        warn("[Path] Computation status failed:", path.Status.Name)
+        return false
+    end
+
     local waypoints = path:GetWaypoints()
-    print(string.format("[Path] Found valid route! Waypoints: %d | Time taken: %.2fs", #waypoints, os.clock() - start))
+    print(string.format("[Path] Calculated %d waypoints for segment.", #waypoints))
+
     V:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
 
     for i, w in ipairs(waypoints) do
+        -- Handle jumps with height safety check
         if w.Action == Enum.PathWaypointAction.Jump then
-            local rp = RaycastParams.new(); rp.FilterDescendantsInstances = {c}; rp.FilterType = Enum.RaycastFilterType.Exclude
-            if not workspace:Raycast(r.Position, Vector3.new(0, 6, 0), rp) then h:ChangeState(Enum.HumanoidStateType.Jumping)
-            else warn(string.format("[Path] Waypoint %d/%d: Jump blocked by ceiling!", i, #waypoints)) end
+            local rp = RaycastParams.new()
+            rp.FilterDescendantsInstances = {c}
+            rp.FilterType = Enum.RaycastFilterType.Exclude
+
+            local ray = workspace:Raycast(r.Position, Vector3.new(0, 6, 0), rp)
+            if not ray then
+                print(string.format("[Path] Waypoint %d: Jumping", i))
+                h:ChangeState(Enum.HumanoidStateType.Jumping)
+            else
+                print(string.format("[Path] Waypoint %d: Jump skipped (obstacle overhead: %s)", i, ray.Instance.Name))
+            end
         end
+
         h:MoveTo(w.Position)
-        local t = 0
-        while t < 1 and (r.Position * Vector3.new(1,0,1) - w.Position * Vector3.new(1,0,1)).Magnitude >= 5 do t += task.wait(0.05) end
-        if t >= 1 then
-            warn(string.format("[Path] Stuck at Waypoint %d/%d! Backing up & retrying...", i, #waypoints))
-            h:MoveTo(r.Position - r.CFrame.LookVector * 4); task.wait(0.4)
+
+        -- Timeout and stuck detection logic
+        local timeElapsed = 0
+        local reached = false
+        
+        while timeElapsed < 1.5 do
+            local distanceFlat = (Vector3.new(r.Position.X, 0, r.Position.Z) - Vector3.new(w.Position.X, 0, w.Position.Z)).Magnitude
+            if distanceFlat < 5 then
+                reached = true
+                break
+            end
+            timeElapsed += task.wait(0.05)
+        end
+
+        if not reached then
+            warn(string.format("[Path] Stuck at waypoint %d/%d (Pos: %s) - Retrying segment...", i, #waypoints, tostring(w.Position)))
+            
+            -- Backtrack maneuver
+            h:MoveTo(r.Position - r.CFrame.LookVector * 4)
+            task.wait(0.4)
+            
             V:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
-            return moveToDestination(target)
+            return navigateSegment(r.Position, targetPos, attempt + 1)
         end
     end
+
+    print("[Path] Segment reached successfully.")
+    return true
+end
+
+-- Divides paths > 1000 studs into smaller targets
+local function moveToDestination(finalTarget: Vector3)
+    local startPos = r.Position
+    local totalDistance = (finalTarget - startPos).Magnitude
+    local chunkCount = math.ceil(totalDistance / MAX_CHUNK_DISTANCE)
+
+    print(string.format("[Path] Starting travel to %s | Total Distance: %.1f studs | Chunks: %d", tostring(finalTarget), totalDistance, chunkCount))
+
+    for chunkIdx = 1, chunkCount do
+        local alpha = math.min(1, chunkIdx / chunkCount)
+        local chunkTarget = startPos:Lerp(finalTarget, alpha)
+
+        print(string.format("[Path] --- Processing Chunk %d/%d (Target: %s) ---", chunkIdx, chunkCount, tostring(chunkTarget)))
+
+        local success = navigateSegment(r.Position, chunkTarget)
+        if not success then
+            warn(string.format("[Path] Failed to complete chunk %d/%d. Aborting traversal.", chunkIdx, chunkCount))
+            V:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+            return false
+        end
+    end
+
     V:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
     print("[Path] Destination reached successfully!")
+    return true
 end
 
 moveToDestination(Vector3.new(2210, 27.5, -4170))
