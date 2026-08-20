@@ -65,7 +65,7 @@ local function navigateSegment(startPos: Vector3, targetPos: Vector3, attempt: n
         local timeElapsed = 0
         local reached = false
         
-        while timeElapsed < 1.5 do
+        while timeElapsed < 3 do
             local distanceFlat = (Vector3.new(r.Position.X, 0, r.Position.Z) - Vector3.new(w.Position.X, 0, w.Position.Z)).Magnitude
             if distanceFlat < 5 then
                 reached = true
