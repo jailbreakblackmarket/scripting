@@ -7,7 +7,7 @@ local c = p.Character or p.CharacterAdded:Wait()
 local h = c:WaitForChild("Humanoid") :: Humanoid
 local r = c:WaitForChild("HumanoidRootPart") :: BasePart
 
-local MAX_CHUNK_DISTANCE = 1000
+    local MAX_CHUNK_DISTANCE = 500
 
 local path = P:CreatePath({
     AgentRadius = 2,
