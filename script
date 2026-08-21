@@ -1,76 +1,96 @@
-local P, V, p = game:GetService("PathfindingService"), game:GetService("VirtualInputManager"), game:GetService("Players").LocalPlayer
-local c = p.Character or p.CharacterAdded:Wait()
-local h, r = c:WaitForChild("Humanoid"), c:WaitForChild("HumanoidRootPart")
-local path = P:CreatePath({AgentRadius = 1.85, AgentHeight = 6.13, AgentCanJump = true, AgentJumpHeight = 7.27, Costs = {Water = 1000}})
+print("[DEBUG] Script initialized.")
 
-local function safeCompute(startPos: Vector3, targetPos: Vector3)
-    if not pcall(function() path:ComputeAsync(startPos, targetPos) end) or path.Status ~= Enum.PathStatus.Success then return nil end
-    return path:GetWaypoints()
+if not game:IsLoaded() then
+    print("[DEBUG] Game not loaded yet. Waiting...")
+    game.Loaded:Wait()
+    task.wait(3)
+    print("[DEBUG] Game loaded.")
 end
 
-local function walkWaypoints(wps)
-    for i, w in ipairs(wps) do
-        local rp = RaycastParams.new()
-        rp.FilterDescendantsInstances, rp.FilterType = {c}, Enum.RaycastFilterType.Exclude
-        
-        -- Permanent jumping logic with ceiling clearance safety
-        if not workspace:Raycast(r.Position, Vector3.new(0, 6.5, 0), rp) then
-            h:ChangeState(Enum.HumanoidStateType.Jumping)
-        end
-        
-        h:MoveTo(w.Position)
-        local t = 0
-        while t < 2 and (r.Position * Vector3.new(1,0,1) - w.Position * Vector3.new(1,0,1)).Magnitude >= 5 do t += task.wait(0.05) end
-        if t >= 2 then
-            warn("[Db] Stuck", i)
-            h:MoveTo(r.Position - r.CFrame.LookVector * 4) task.wait(0.4)
-            return false
-        end
-    end
-    return true
-end
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local function moveToDestination(dest: Vector3)
-    V:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+print("[DEBUG] LocalPlayer and PlayerGui initialized:", Player.Name)
+
+-- 1. Attempting Remote Event Firing for Spawn / Police Selection
+local spawnRemote = ReplicatedStorage:FindFirstChild("SpawnSelectionSelect", true)
+if spawnRemote and spawnRemote:IsA("RemoteEvent") then
+    print("[DEBUG] Found SpawnSelectionSelect RemoteEvent at:", spawnRemote:GetFullName())
     
-    local currTarget = r.Position + (dest - r.Position).Unit * math.min((dest - r.Position).Magnitude, 250)
-    local currWps = safeCompute(r.Position, currTarget)
+    local ok1, err1 = pcall(function() spawnRemote:FireServer("Police") end)
+    print("[DEBUG] FireServer('Police') status:", ok1 and "Success" or "Failed: " .. tostring(err1))
+    
+    local ok2, err2 = pcall(function() spawnRemote:FireServer(1) end)
+    print("[DEBUG] FireServer(1) status:", ok2 and "Success" or "Failed: " .. tostring(err2))
+else
+    print("[DEBUG] SpawnSelectionSelect RemoteEvent NOT found!")
+end
 
-    while (r.Position * Vector3.new(1,0,1) - dest * Vector3.new(1,0,1)).Magnitude > 6 do
-        if not currWps then
-            warn("[Db] Unreachable step. Retrying...")
-            task.wait(0.5)
-            currTarget = r.Position + (dest - r.Position).Unit * math.min((dest - r.Position).Magnitude, 250)
-            currWps = safeCompute(r.Position, currTarget)
-            continue
-        end
+-- 2. UI Module and Loop Handling
+local folder = ReplicatedStorage:FindFirstChild("TeamSelect")
+if folder then
+    print("[DEBUG] Found 'TeamSelect' folder in ReplicatedStorage.")
+    local module = folder:FindFirstChild("TeamChooseUI")
+    if module then
+        print("[DEBUG] Found 'TeamChooseUI' module.")
+        local ok, teamSelect = pcall(require, module)
 
-        -- Calculate next chunk asynchronously in background while walking current chunk
-        local nextWps = nil
-        local prefetchThread = task.spawn(function()
-            local remainingDist = (dest - currTarget).Magnitude
-            if remainingDist > 6 then
-                local nextTarget = currTarget + (dest - currTarget).Unit * math.min(remainingDist, 250)
-                nextWps = safeCompute(currTarget, nextTarget)
+        if ok and type(teamSelect) == "table" then
+            print("[DEBUG] Successfully required 'TeamChooseUI' module.")
+            
+            if type(teamSelect.Hide) == "function" then
+                print("[DEBUG] 'Hide' function exists in module. Starting repeat loop...")
+                local timeout = os.clock() + 10
+
+                repeat
+                    local hideOk, hideErr = pcall(teamSelect.Hide)
+                    if not hideOk then
+                        print("[DEBUG] Error calling teamSelect.Hide():", hideErr)
+                    end
+                    
+                    task.wait(0.5) -- Increased slightly to prevent spamming debug logs
+                    
+                    local gui = PlayerGui:FindFirstChild("TeamSelectGui")
+                    local character = Player.Character
+                    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                    
+                    local guiDisabled = not gui or not gui.Enabled
+                    local currentTeamColor = Player.TeamColor
+                    local isPoliceTeam = currentTeamColor == BrickColor.new("Bright blue")
+                    local isDead = humanoid and humanoid.Health <= 0
+                    local timedOut = os.clock() > timeout
+                    
+                    print(string.format("[DEBUG Loop] Team: %s | GuiDisabled: %s | IsPolice: %s | IsDead: %s", 
+                        tostring(currentTeamColor), 
+                        tostring(guiDisabled), 
+                        tostring(isPoliceTeam), 
+                        tostring(isDead)
+                    ))
+                    
+                until guiDisabled or isPoliceTeam or isDead or timedOut
+                print("[DEBUG] Exited team selection loop.")
+            else
+                print("[DEBUG] 'Hide' is not a valid function in TeamChooseUI.")
             end
-        end)
-
-        local success = walkWaypoints(currWps)
-        
-        if success then
-            if not nextWps and coroutine.status(prefetchThread) ~= "dead" then
-                repeat task.wait(0.05) until nextWps or coroutine.status(prefetchThread) == "dead"
-            end
-            currWps = nextWps
-            currTarget = r.Position + (dest - r.Position).Unit * math.min((dest - r.Position).Magnitude, 250)
         else
-            currWps = nil
-            task.wait(0.2)
+            print("[DEBUG] Failed to require 'TeamChooseUI'. Error:", tostring(teamSelect))
         end
+    else
+        print("[DEBUG] 'TeamChooseUI' module missing in TeamSelect folder.")
     end
-    
-    V:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
-    print("[Db] Reached Final!")
+else
+    print("[DEBUG] 'TeamSelect' folder missing in ReplicatedStorage.")
 end
 
-moveToDestination(Vector3.new(2210, 27.5, -4170))
+-- 3. Character Verification
+if not Player.Character then
+    print("[DEBUG] Character not found. Waiting for CharacterAdded...")
+    Player.CharacterAdded:Wait()
+    print("[DEBUG] Character loaded.")
+else
+    print("[DEBUG] Character already exists.")
+end
+
+print("[DEBUG] Script execution completed.")
