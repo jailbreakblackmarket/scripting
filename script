@@ -7,65 +7,34 @@ local character = player.Character or player.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid") :: Humanoid
 local rootPart = character:WaitForChild("HumanoidRootPart") :: BasePart
 
-local CHUNK_DISTANCE = 250
+local SEGMENT_DISTANCE = 300 -- Safe distance for local navmesh resolution
 
--- Main precise path generator
 local path = PathfindingService:CreatePath({
-    AgentRadius = 3,
-    AgentHeight = 8,
+    AgentRadius = 2.5,
+    AgentHeight = 6,
     AgentCanJump = true,
-    AgentJumpHeight = 7,
+    AgentJumpHeight = 8,
     Costs = { Water = 1000 }
 })
 
--- Low-cost path generator for long-range target discovery
-local longPath = PathfindingService:CreatePath({
-    AgentRadius = 6,
-    AgentHeight = 8,
-    AgentCanJump = true,
-    Costs = { Water = 1000 }
-})
-
-local function safeComputePath(pathObj, startPos: Vector3, endPos: Vector3)
+local function safeComputeWaypoints(startPos: Vector3, endPos: Vector3)
     local success, _ = pcall(function()
-        pathObj:ComputeAsync(startPos, endPos)
+        path:ComputeAsync(startPos, endPos)
     end)
-    if success and pathObj.Status == Enum.PathStatus.Success then
-        return pathObj:GetWaypoints()
+    
+    if success and path.Status == Enum.PathStatus.Success then
+        local waypoints = path:GetWaypoints()
+        if #waypoints > 0 then
+            return waypoints
+        end
     end
     return nil
-end
-
--- Extracts a sub-target along the coarse route instead of raw Vector lerping
-local function getNavigableSubTarget(startPos: Vector3, finalDestination: Vector3): Vector3
-    local coarseWaypoints = safeComputePath(longPath, startPos, finalDestination)
-    
-    if not coarseWaypoints or #coarseWaypoints == 0 then
-        -- Fallback to direct target if coarse path fails
-        return finalDestination
-    end
-
-    local accumulatedDist = 0
-    for i = 1, #coarseWaypoints - 1 do
-        local p1 = coarseWaypoints[i].Position
-        local p2 = coarseWaypoints[i + 1].Position
-        local legDist = (p2 - p1).Magnitude
-        
-        if accumulatedDist + legDist >= CHUNK_DISTANCE then
-            local remaining = CHUNK_DISTANCE - accumulatedDist
-            return p1:Lerp(p2, remaining / legDist)
-        end
-        accumulatedDist += legDist
-    end
-
-    return coarseWaypoints[#coarseWaypoints].Position
 end
 
 local function walkWaypoints(waypoints): boolean
     VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
 
     for i, wp in ipairs(waypoints) do
-        -- Jump handling with overhead clearance check
         if wp.Action == Enum.PathWaypointAction.Jump then
             local rp = RaycastParams.new()
             rp.FilterDescendantsInstances = {character}
@@ -81,18 +50,18 @@ local function walkWaypoints(waypoints): boolean
 
         local reached = false
         local timeout = 0
-        while timeout < 3 do
+        while timeout < 3.5 do
             local distFlat = (Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z) - Vector3.new(wp.Position.X, 0, wp.Position.Z)).Magnitude
-            if distFlat < 4.5 then
+            if distFlat < 5 then
                 reached = true
                 break
             end
             timeout += task.wait(0.05)
         end
 
-        -- Un-stuck / Backtrack routine
+        -- Un-stuck maneuver if stuck at a waypoint
         if not reached then
-            warn(string.format("[Path] Stuck at waypoint %d/%d. Executing backtrack...", i, #waypoints))
+            warn(string.format("[Path] Stuck at waypoint %d/%d. Re-routing...", i, #waypoints))
             humanoid:MoveTo(rootPart.Position - rootPart.CFrame.LookVector * 5)
             task.wait(0.4)
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
@@ -104,33 +73,50 @@ local function walkWaypoints(waypoints): boolean
 end
 
 local function traverseLongDistance(finalDestination: Vector3)
-    while (Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z) - Vector3.new(finalDestination.X, 0, finalDestination.Z)).Magnitude > 6 do
-        
-        local subTarget = getNavigableSubTarget(rootPart.Position, finalDestination)
-        local currentWaypoints = safeComputePath(path, rootPart.Position, subTarget)
+    print("[Path] Starting travel to", finalDestination)
 
-        if not currentWaypoints then
-            warn("[Path] Could not compute segment. Retrying in 1s...")
-            task.wait(1)
-            continue
+    while true do
+        local currentPos = rootPart.Position
+        local distToFinal = (Vector3.new(currentPos.X, 0, currentPos.Z) - Vector3.new(finalDestination.X, 0, finalDestination.Z)).Magnitude
+
+        if distToFinal < 8 then
+            break
         end
 
-        -- Pre-fetch next target asynchronously mid-way through current execution
-        local nextSubTarget = nil
-        local prefetchThread = task.spawn(function()
-            task.wait(0.2) -- Small delay to avoid API throttling
-            nextSubTarget = getNavigableSubTarget(subTarget, finalDestination)
-        end)
+        -- Direct target capped at max local distance
+        local moveDir = (finalDestination - currentPos).Unit
+        local stepDist = math.min(distToFinal, SEGMENT_DISTANCE)
+        local targetPos = currentPos + (moveDir * stepDist)
 
-        local success = walkWaypoints(currentWaypoints)
-        if not success then
-            warn("[Path] Segment failed. Recalculating route from current position...")
-            task.wait(0.2)
+        -- Compute local segment
+        local waypoints = safeComputeWaypoints(currentPos, targetPos)
+
+        -- Raycast ray fallback if pathing fails on unstreamed or open ground
+        if not waypoints then
+            warn("[Path] Pathfinding compute failed. Attempting direction fallback...")
+            local rayParams = RaycastParams.new()
+            rayParams.FilterDescendantsInstances = {character}
+            rayParams.FilterType = Enum.RaycastFilterType.Exclude
+            
+            local rayResult = workspace:Raycast(currentPos, moveDir * stepDist, rayParams)
+            local fallbackTarget = rayResult and rayResult.Position or targetPos
+            
+            waypoints = safeComputeWaypoints(currentPos, fallbackTarget)
+        end
+
+        if waypoints then
+            local success = walkWaypoints(waypoints)
+            if not success then
+                task.wait(0.2)
+            end
+        else
+            warn("[Path] Retrying step in 0.5s...")
+            task.wait(0.5)
         end
     end
 
     VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
-    print("[Path] Long distance traversal completed successfully!")
+    print("[Path] Destination reached successfully!")
     return true
 end
 
