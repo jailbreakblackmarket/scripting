@@ -40,6 +40,8 @@ end
 -- Draws a neon cylinder line connecting two points
 local function createPathLine(startPos, endPos)
 	local distance = (startPos - endPos).Magnitude
+	if distance < 0.1 then return end
+	
 	local line = Instance.new("Part")
 	line.Size = Vector3.new(0.3, 0.3, distance)
 	line.CFrame = CFrame.lookAt(startPos, endPos) * CFrame.new(0, 0, -distance / 2)
@@ -56,9 +58,22 @@ local function flatDistanceSq(v1, v2)
 	return (dx * dx) + (dz * dz)
 end
 
--- Line-of-sight raycast check
+-- Height-aware Line-of-sight check to prevent cutting through bridges/ceilings
 local function hasLineOfSight(startPos, endPos, character)
 	raycastParams.FilterDescendantsInstances = {character, debugFolder}
+	
+	-- 1. Prevent shortcutting if vertical height gap is larger than step height
+	if math.abs(endPos.Y - startPos.Y) > 4 then
+		return false
+	end
+
+	-- 2. Prevent shortcutting if trapped under an overhead surface (e.g. under a bridge)
+	local ceilingCheck = workspace:Raycast(startPos, Vector3.new(0, 6.5, 0), raycastParams)
+	if ceilingCheck then
+		return false
+	end
+
+	-- 3. Raycast directly to target waypoint
 	local direction = endPos - startPos
 	return workspace:Raycast(startPos, direction, raycastParams) == nil
 end
@@ -78,7 +93,7 @@ local function navigateWithVisuals(destPos)
 	local totalWaypoints = #waypoints
 	if totalWaypoints == 0 then return end
 
-	-- Draw initial raw waypoints
+	-- Draw initial raw path points (Red)
 	for _, wp in ipairs(waypoints) do
 		createWaypointMarker(wp.Position, false)
 	end
@@ -89,11 +104,12 @@ local function navigateWithVisuals(destPos)
 	while currentIndex <= totalWaypoints do
 		if hum.Health <= 0 then break end
 
-		-- Lookahead Raycasting (Path Smoothing)
+		-- Lookahead Raycasting (Path Smoothing with Bridge Safeguard)
 		local targetIndex = currentIndex
 		for lookAhead = math.min(currentIndex + 4, totalWaypoints), currentIndex + 1, -1 do
-			if waypoints[lookAhead].Action ~= Enum.PathWaypointAction.Jump then
-				if hasLineOfSight(hrp.Position, waypoints[lookAhead].Position, char) then
+			local targetWP = waypoints[lookAhead]
+			if targetWP.Action ~= Enum.PathWaypointAction.Jump then
+				if hasLineOfSight(hrp.Position, targetWP.Position, char) then
 					targetIndex = lookAhead
 					break
 				end
@@ -103,7 +119,7 @@ local function navigateWithVisuals(destPos)
 		currentIndex = targetIndex
 		local currentWP = waypoints[currentIndex]
 
-		-- Visualize active smoothed step
+		-- Visualize active smoothed step (Green)
 		createWaypointMarker(currentWP.Position, true)
 		createPathLine(previousPosition, currentWP.Position)
 		previousPosition = currentWP.Position
@@ -114,7 +130,7 @@ local function navigateWithVisuals(destPos)
 
 		hum:MoveTo(currentWP.Position)
 
-		-- Wait until character reaches waypoint target (squared distance threshold 16)
+		-- Wait until character reaches current waypoint target
 		while flatDistanceSq(hrp.Position, currentWP.Position) > 16 do
 			if hum.Health <= 0 then
 				clearDebugVisuals()
@@ -126,89 +142,9 @@ local function navigateWithVisuals(destPos)
 		currentIndex += 1
 	end
 
-	-- Fade out debug visuals after arriving
+	-- Fade out debug visuals 3 seconds after arriving
 	task.delay(3, clearDebugVisuals)
 end
 
--- Run navigation with debug lines
-navigateWithVisuals(Vector3.new(2210, 27.5, -4170))local PathfindingService = game:GetService("PathfindingService")
-local Players = game:GetService("Players")
-
-local player = Players.LocalPlayer
-
-local path = PathfindingService:CreatePath({
-	AgentRadius = 2,
-	AgentHeight = 6,
-	AgentCanJump = true,
-	AgentJumpHeight = 6.37,
-	Costs = { Water = 1000 }
-})
-
-local raycastParams = RaycastParams.new()
-raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-
--- Calculate flat 2D distance squared (avoids expensive math.sqrt)
-local function flatDistanceSq(v1, v2)
-	local dx = v1.X - v2.X
-	local dz = v1.Z - v2.Z
-	return (dx * dx) + (dz * dz)
-end
-
--- Checks if character can walk directly to a point without hitting walls
-local function hasLineOfSight(startPos, endPos, character)
-	raycastParams.FilterDescendantsInstances = {character}
-	local direction = endPos - startPos
-	local result = workspace:Raycast(startPos, direction, raycastParams)
-	return result == nil
-end
-
-local function navigateStaticPath(destPos)
-	local char = player.Character or player.CharacterAdded:Wait()
-	local hum = char:WaitForChild("Humanoid")
-	local hrp = char:WaitForChild("HumanoidRootPart")
-
-	-- Compute full path ONCE at start
-	local success = pcall(path.ComputeAsync, path, hrp.Position, destPos)
-	if not success or path.Status ~= Enum.PathStatus.Success then return end
-
-	local waypoints = path:GetWaypoints()
-	local totalWaypoints = #waypoints
-	if totalWaypoints == 0 then return end
-
-	local currentIndex = 1
-
-	while currentIndex <= totalWaypoints do
-		if hum.Health <= 0 then break end
-
-		-- PATH SMOOTHING: Look ahead to skip unnecessary waypoints if line of sight is clear
-		local targetIndex = currentIndex
-		for lookAhead = math.min(currentIndex + 4, totalWaypoints), currentIndex + 1, -1 do
-			if waypoints[lookAhead].Action ~= Enum.PathWaypointAction.Jump then
-				if hasLineOfSight(hrp.Position, waypoints[lookAhead].Position, char) then
-					targetIndex = lookAhead
-					break
-				end
-			end
-		end
-
-		currentIndex = targetIndex
-		local currentWP = waypoints[currentIndex]
-
-		if currentWP.Action == Enum.PathWaypointAction.Jump then
-			hum:ChangeState(Enum.HumanoidStateType.Jumping)
-		end
-
-		hum:MoveTo(currentWP.Position)
-
-		-- Wait until close enough to waypoint (using 16 = 4^2 studs squared distance)
-		while flatDistanceSq(hrp.Position, currentWP.Position) > 16 do
-			if hum.Health <= 0 then return end
-			task.wait(0.03) -- Low overhead check interval
-		end
-
-		currentIndex += 1
-	end
-end
-
--- Run static navigation
-navigateStaticPath(Vector3.new(2210, 27.5, -4170))
+-- Run navigation to destination
+navigateWithVisuals(Vector3.new(2210, 27.5, -4170))
