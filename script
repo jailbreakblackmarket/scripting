@@ -7,7 +7,7 @@ local character = player.Character or player.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid") :: Humanoid
 local rootPart = character:WaitForChild("HumanoidRootPart") :: BasePart
 
-local SEGMENT_DISTANCE = 300 -- Safe distance for local navmesh resolution
+local SEGMENT_DISTANCE = 300
 
 local path = PathfindingService:CreatePath({
     AgentRadius = 2.5,
@@ -28,7 +28,33 @@ local function safeComputeWaypoints(startPos: Vector3, endPos: Vector3)
             return waypoints
         end
     end
+    
+    -- Fallback: Raycast along vector direction if pathfinding engine fails
+    local moveDir = (endPos - startPos).Unit
+    local dist = (endPos - startPos).Magnitude
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {character}
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    local rayResult = workspace:Raycast(startPos, moveDir * dist, rayParams)
+    local fallbackTarget = rayResult and rayResult.Position or endPos
+
+    local successFallback, _ = pcall(function()
+        path:ComputeAsync(startPos, fallbackTarget)
+    end)
+    
+    if successFallback and path.Status == Enum.PathStatus.Success then
+        return path:GetWaypoints()
+    end
+
     return nil
+end
+
+local function getTargetPosition(fromPos: Vector3, finalDestination: Vector3): Vector3
+    local distToFinal = (Vector3.new(fromPos.X, 0, fromPos.Z) - Vector3.new(finalDestination.X, 0, finalDestination.Z)).Magnitude
+    local moveDir = (finalDestination - fromPos).Unit
+    local stepDist = math.min(distToFinal, SEGMENT_DISTANCE)
+    return fromPos + (moveDir * stepDist)
 end
 
 local function walkWaypoints(waypoints): boolean
@@ -59,7 +85,6 @@ local function walkWaypoints(waypoints): boolean
             timeout += task.wait(0.05)
         end
 
-        -- Un-stuck maneuver if stuck at a waypoint
         if not reached then
             warn(string.format("[Path] Stuck at waypoint %d/%d. Re-routing...", i, #waypoints))
             humanoid:MoveTo(rootPart.Position - rootPart.CFrame.LookVector * 5)
@@ -73,7 +98,11 @@ local function walkWaypoints(waypoints): boolean
 end
 
 local function traverseLongDistance(finalDestination: Vector3)
-    print("[Path] Starting travel to", finalDestination)
+    print("[Path] Starting seamless travel to", finalDestination)
+
+    -- 1. Initial computation for first segment
+    local currentTarget = getTargetPosition(rootPart.Position, finalDestination)
+    local currentWaypoints = safeComputeWaypoints(rootPart.Position, currentTarget)
 
     while true do
         local currentPos = rootPart.Position
@@ -83,35 +112,38 @@ local function traverseLongDistance(finalDestination: Vector3)
             break
         end
 
-        -- Direct target capped at max local distance
-        local moveDir = (finalDestination - currentPos).Unit
-        local stepDist = math.min(distToFinal, SEGMENT_DISTANCE)
-        local targetPos = currentPos + (moveDir * stepDist)
-
-        -- Compute local segment
-        local waypoints = safeComputeWaypoints(currentPos, targetPos)
-
-        -- Raycast ray fallback if pathing fails on unstreamed or open ground
-        if not waypoints then
-            warn("[Path] Pathfinding compute failed. Attempting direction fallback...")
-            local rayParams = RaycastParams.new()
-            rayParams.FilterDescendantsInstances = {character}
-            rayParams.FilterType = Enum.RaycastFilterType.Exclude
-            
-            local rayResult = workspace:Raycast(currentPos, moveDir * stepDist, rayParams)
-            local fallbackTarget = rayResult and rayResult.Position or targetPos
-            
-            waypoints = safeComputeWaypoints(currentPos, fallbackTarget)
+        if not currentWaypoints then
+            warn("[Path] No valid route for current segment. Retrying in 0.5s...")
+            task.wait(0.5)
+            currentTarget = getTargetPosition(rootPart.Position, finalDestination)
+            currentWaypoints = safeComputeWaypoints(rootPart.Position, currentTarget)
+            continue
         end
 
-        if waypoints then
-            local success = walkWaypoints(waypoints)
-            if not success then
-                task.wait(0.2)
+        -- 2. Pre-fetch next segment in parallel while walking current segment
+        local nextWaypoints = nil
+        local prefetchThread = task.spawn(function()
+            local nextTarget = getTargetPosition(currentTarget, finalDestination)
+            nextWaypoints = safeComputeWaypoints(currentTarget, nextTarget)
+        end)
+
+        -- 3. Walk current segment
+        local success = walkWaypoints(currentWaypoints)
+
+        if success then
+            -- Wait for background pre-fetch to finish if not completed yet
+            if not nextWaypoints and coroutine.status(prefetchThread) ~= "dead" then
+                repeat task.wait(0.05) until nextWaypoints or coroutine.status(prefetchThread) == "dead"
             end
+
+            -- Advance targets
+            currentWaypoints = nextWaypoints
+            currentTarget = getTargetPosition(rootPart.Position, finalDestination)
         else
-            warn("[Path] Retrying step in 0.5s...")
-            task.wait(0.5)
+            -- Re-evaluate route from current position if stuck
+            task.wait(0.2)
+            currentTarget = getTargetPosition(rootPart.Position, finalDestination)
+            currentWaypoints = safeComputeWaypoints(rootPart.Position, currentTarget)
         end
     end
 
