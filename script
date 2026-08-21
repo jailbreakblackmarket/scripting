@@ -4,7 +4,7 @@ local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 
 local path = PathfindingService:CreatePath({
-	AgentRadius = 2,
+	AgentRadius = 2.5, -- Un peu plus large pour éviter de raser les bateaux/murs
 	AgentHeight = 6,
 	AgentCanJump = true,
 	AgentJumpHeight = 6.37,
@@ -23,7 +23,6 @@ local function clearDebugVisuals()
 	debugFolder:ClearAllChildren()
 end
 
--- Renders a sphere at a waypoint position
 local function createWaypointMarker(pos, isSmoothed)
 	local sphere = Instance.new("Part")
 	sphere.Shape = Enum.PartType.Ball
@@ -37,11 +36,10 @@ local function createWaypointMarker(pos, isSmoothed)
 	sphere.Parent = debugFolder
 end
 
--- Draws a neon cylinder line connecting two points
 local function createPathLine(startPos, endPos)
 	local distance = (startPos - endPos).Magnitude
 	if distance < 0.1 then return end
-	
+
 	local line = Instance.new("Part")
 	line.Size = Vector3.new(0.3, 0.3, distance)
 	line.CFrame = CFrame.lookAt(startPos, endPos) * CFrame.new(0, 0, -distance / 2)
@@ -52,30 +50,30 @@ local function createPathLine(startPos, endPos)
 	line.Parent = debugFolder
 end
 
--- 2D Squared distance comparison
 local function flatDistanceSq(v1, v2)
 	local dx, dz = v1.X - v2.X, v1.Z - v2.Z
 	return (dx * dx) + (dz * dz)
 end
 
--- Height-aware Line-of-sight check to prevent cutting through bridges/ceilings
-local function hasLineOfSight(startPos, endPos, character)
+-- Test de ligne de vue épais (Spherecast) pour détecter les objets complexes comme les bateaux
+local function hasLineOfSight(startPos, endPos, character, hum)
 	raycastParams.FilterDescendantsInstances = {character, debugFolder}
-	
-	-- 1. Prevent shortcutting if vertical height gap is larger than step height
-	if math.abs(endPos.Y - startPos.Y) > 4 then
+
+	-- Ne pas sauter de waypoints si le personnage nage (l'eau bloque souvent les trajectoires)
+	if hum:GetState() == Enum.HumanoidStateType.Swimming then
 		return false
 	end
 
-	-- 2. Prevent shortcutting if trapped under an overhead surface (e.g. under a bridge)
-	local ceilingCheck = workspace:Raycast(startPos, Vector3.new(0, 6.5, 0), raycastParams)
-	if ceilingCheck then
+	-- Limite d'élévation
+	if math.abs(endPos.Y - startPos.Y) > 3 then
 		return false
 	end
 
-	-- 3. Raycast directly to target waypoint
+	-- Sphère de test d'un rayon de 1.5 stud pour simuler la largeur du corps
 	local direction = endPos - startPos
-	return workspace:Raycast(startPos, direction, raycastParams) == nil
+	local result = workspace:Spherecast(startPos + Vector3.new(0, 1, 0), 1.5, direction, raycastParams)
+
+	return result == nil
 end
 
 local function navigateWithVisuals(destPos)
@@ -85,7 +83,6 @@ local function navigateWithVisuals(destPos)
 	local hum = char:WaitForChild("Humanoid")
 	local hrp = char:WaitForChild("HumanoidRootPart")
 
-	-- Compute static path
 	local success = pcall(path.ComputeAsync, path, hrp.Position, destPos)
 	if not success or path.Status ~= Enum.PathStatus.Success then return end
 
@@ -93,7 +90,6 @@ local function navigateWithVisuals(destPos)
 	local totalWaypoints = #waypoints
 	if totalWaypoints == 0 then return end
 
-	-- Draw initial raw path points (Red)
 	for _, wp in ipairs(waypoints) do
 		createWaypointMarker(wp.Position, false)
 	end
@@ -104,12 +100,13 @@ local function navigateWithVisuals(destPos)
 	while currentIndex <= totalWaypoints do
 		if hum.Health <= 0 then break end
 
-		-- Lookahead Raycasting (Path Smoothing with Bridge Safeguard)
 		local targetIndex = currentIndex
-		for lookAhead = math.min(currentIndex + 4, totalWaypoints), currentIndex + 1, -1 do
+
+		-- Essaye de lisser le chemin seulement si le personnage n'est pas dans l'eau
+		for lookAhead = math.min(currentIndex + 3, totalWaypoints), currentIndex + 1, -1 do
 			local targetWP = waypoints[lookAhead]
 			if targetWP.Action ~= Enum.PathWaypointAction.Jump then
-				if hasLineOfSight(hrp.Position, targetWP.Position, char) then
+				if hasLineOfSight(hrp.Position, targetWP.Position, char, hum) then
 					targetIndex = lookAhead
 					break
 				end
@@ -119,7 +116,6 @@ local function navigateWithVisuals(destPos)
 		currentIndex = targetIndex
 		local currentWP = waypoints[currentIndex]
 
-		-- Visualize active smoothed step (Green)
 		createWaypointMarker(currentWP.Position, true)
 		createPathLine(previousPosition, currentWP.Position)
 		previousPosition = currentWP.Position
@@ -130,11 +126,17 @@ local function navigateWithVisuals(destPos)
 
 		hum:MoveTo(currentWP.Position)
 
-		-- Wait until character reaches current waypoint target
-		while flatDistanceSq(hrp.Position, currentWP.Position) > 16 do
+		-- Timeout anti-blocage si coincé contre la coque d'un bateau
+		local startTime = os.clock()
+		while flatDistanceSq(hrp.Position, currentWP.Position) > 9 do
 			if hum.Health <= 0 then
 				clearDebugVisuals()
 				return
+			end
+
+			-- Si bloqué plus de 1.5 seconde sur un waypoint, abandonne le lissage
+			if os.clock() - startTime > 1.5 then
+				break
 			end
 			task.wait(0.03)
 		end
@@ -142,9 +144,7 @@ local function navigateWithVisuals(destPos)
 		currentIndex += 1
 	end
 
-	-- Fade out debug visuals 3 seconds after arriving
 	task.delay(3, clearDebugVisuals)
 end
 
--- Run navigation to destination
 navigateWithVisuals(Vector3.new(2210, 27.5, -4170))
