@@ -1,96 +1,153 @@
-print("[DEBUG] Script initialized.")
-
-if not game:IsLoaded() then
-    print("[DEBUG] Game not loaded yet. Waiting...")
-    game.Loaded:Wait()
-    task.wait(3)
-    print("[DEBUG] Game loaded.")
-end
-
+-- Services
+local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Player = Players.LocalPlayer
-local PlayerGui = Player:WaitForChild("PlayerGui")
-print("[DEBUG] LocalPlayer and PlayerGui initialized:", Player.Name)
+-- Configuration Parameters
+local AGENT_PARAMS = {
+	AgentRadius = 2,
+	AgentHeight = 5,
+	AgentCanJump = true,
+	Costs = {
+		Water = math.huge, -- Avoid water terrain
+		-- CustomMaterial = 10 -- Example for custom PathfindingModifiers
+	}
+}
 
--- 1. Attempting Remote Event Firing for Spawn / Police Selection
-local spawnRemote = ReplicatedStorage:FindFirstChild("SpawnSelectionSelect", true)
-if spawnRemote and spawnRemote:IsA("RemoteEvent") then
-    print("[DEBUG] Found SpawnSelectionSelect RemoteEvent at:", spawnRemote:GetFullName())
-    
-    local ok1, err1 = pcall(function() spawnRemote:FireServer("Police") end)
-    print("[DEBUG] FireServer('Police') status:", ok1 and "Success" or "Failed: " .. tostring(err1))
-    
-    local ok2, err2 = pcall(function() spawnRemote:FireServer(1) end)
-    print("[DEBUG] FireServer(1) status:", ok2 and "Success" or "Failed: " .. tostring(err2))
-else
-    print("[DEBUG] SpawnSelectionSelect RemoteEvent NOT found!")
+local RECOMPUTE_DISTANCE_THRESHOLD = 5 -- Waypoints to skip recomputation if obstacle is far behind
+
+-- Path Navigator Class
+local PathNavigator = {}
+PathNavigator.__index = PathNavigator
+
+function PathNavigator.new(character)
+	local self = setmetatable({}, PathNavigator)
+	self.Character = character
+	self.Humanoid = character:WaitForChild("Humanoid")
+	self.PrimaryPart = character.PrimaryPart or character:WaitForChild("HumanoidRootPart")
+	
+	self.CurrentPath = nil
+	self.BlockedConnection = nil
+	self.MoveFinishedConnection = nil
+	self.CurrentWaypointIndex = 1
+	self.IsMoving = false
+	self.CurrentDestination = nil
+	
+	return self
 end
 
--- 2. UI Module and Loop Handling
-local folder = ReplicatedStorage:FindFirstChild("TeamSelect")
-if folder then
-    print("[DEBUG] Found 'TeamSelect' folder in ReplicatedStorage.")
-    local module = folder:FindFirstChild("TeamChooseUI")
-    if module then
-        print("[DEBUG] Found 'TeamChooseUI' module.")
-        local ok, teamSelect = pcall(require, module)
+-- Core Function: Move to Destination
+function PathNavigator:MoveTo(destination: Vector3)
+	self:Stop() -- Cancel any active pathfinding task
+	self.CurrentDestination = destination
+	self.IsMoving = true
 
-        if ok and type(teamSelect) == "table" then
-            print("[DEBUG] Successfully required 'TeamChooseUI' module.")
-            
-            if type(teamSelect.Hide) == "function" then
-                print("[DEBUG] 'Hide' function exists in module. Starting repeat loop...")
-                local timeout = os.clock() + 10
+	-- Phase 1 & 2: Setup Agent Configuration and Compute Path
+	local path = PathfindingService:CreatePath(AGENT_PARAMS)
+	self.CurrentPath = path
 
-                repeat
-                    local hideOk, hideErr = pcall(teamSelect.Hide)
-                    if not hideOk then
-                        print("[DEBUG] Error calling teamSelect.Hide():", hideErr)
-                    end
-                    
-                    task.wait(0.5) -- Increased slightly to prevent spamming debug logs
-                    
-                    local gui = PlayerGui:FindFirstChild("TeamSelectGui")
-                    local character = Player.Character
-                    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-                    
-                    local guiDisabled = not gui or not gui.Enabled
-                    local currentTeamColor = Player.TeamColor
-                    local isPoliceTeam = currentTeamColor == BrickColor.new("Bright blue")
-                    local isDead = humanoid and humanoid.Health <= 0
-                    local timedOut = os.clock() > timeout
-                    
-                    print(string.format("[DEBUG Loop] Team: %s | GuiDisabled: %s | IsPolice: %s | IsDead: %s", 
-                        tostring(currentTeamColor), 
-                        tostring(guiDisabled), 
-                        tostring(isPoliceTeam), 
-                        tostring(isDead)
-                    ))
-                    
-                until guiDisabled or isPoliceTeam or isDead or timedOut
-                print("[DEBUG] Exited team selection loop.")
-            else
-                print("[DEBUG] 'Hide' is not a valid function in TeamChooseUI.")
-            end
-        else
-            print("[DEBUG] Failed to require 'TeamChooseUI'. Error:", tostring(teamSelect))
-        end
-    else
-        print("[DEBUG] 'TeamChooseUI' module missing in TeamSelect folder.")
-    end
-else
-    print("[DEBUG] 'TeamSelect' folder missing in ReplicatedStorage.")
+	local success, errorMessage = pcall(function()
+		path:ComputeAsync(self.PrimaryPart.Position, destination)
+	end)
+
+	if not success or path.Status ~= Enum.PathStatus.Success then
+		warn("[PathNavigator] Path computation failed: " .. tostring(errorMessage or path.Status))
+		self.IsMoving = false
+		return false
+	end
+
+	local waypoints = path:GetWaypoints()
+	self.CurrentWaypointIndex = 1
+
+	-- Phase 4: Dynamic Re-routing (Blocked Listener)
+	self.BlockedConnection = path.Blocked:Connect(function(blockedWaypointIndex)
+		-- Only recalculate if the blocked waypoint is ahead of our current progress
+		if blockedWaypointIndex >= self.CurrentWaypointIndex then
+			warn("[PathNavigator] Path blocked at waypoint " .. blockedWaypointIndex .. ". Recalculating...")
+			self:MoveTo(self.CurrentDestination) -- Recalculate route from current position
+		end
+	end)
+
+	-- Phase 3: Waypoint Traversal Loop
+	task.spawn(function()
+		for index, waypoint in ipairs(waypoints) do
+			if not self.IsMoving or self.CurrentPath ~= path then
+				break -- Stop execution if path was interrupted or reset
+			end
+
+			self.CurrentWaypointIndex = index
+
+			-- Check if action requires jumping
+			if waypoint.Action == Enum.PathWaypointAction.Jump then
+				self.Humanoid.Jump = true
+			end
+
+			-- Navigate to waypoint
+			self.Humanoid:MoveTo(waypoint.Position)
+
+			-- Wait until waypoint is reached or a timeout occurs
+			local reached = self:_waitForMoveToFinished(8)
+			if not reached then
+				warn("[PathNavigator] Movement timed out trying to reach waypoint " .. index .. ". Recalculating...")
+				self:MoveTo(self.CurrentDestination)
+				break
+			end
+		end
+
+		if self.CurrentPath == path then
+			self:CleanupConnections()
+			self.IsMoving = false
+		end
+	end)
+
+	return true
 end
 
--- 3. Character Verification
-if not Player.Character then
-    print("[DEBUG] Character not found. Waiting for CharacterAdded...")
-    Player.CharacterAdded:Wait()
-    print("[DEBUG] Character loaded.")
-else
-    print("[DEBUG] Character already exists.")
+-- Helper: Wait for MoveToFinished safely with a timeout safeguard
+function PathNavigator:_waitForMoveToFinished(timeout: number): boolean
+	local bindable = Instance.new("BindableEvent")
+	local completed = false
+
+	local conn
+	conn = self.Humanoid.MoveToFinished:Connect(function(reached)
+		completed = reached
+		bindable:Fire()
+	end)
+
+	task.delay(timeout, function()
+		if conn.Connected then
+			completed = false
+			bindable:Fire()
+		end
+	end)
+
+	bindable.Event:Wait()
+	conn:Disconnect()
+	bindable:Destroy()
+
+	return completed
 end
 
-print("[DEBUG] Script execution completed.")
+-- Stop current movement and disconnect active listeners
+function PathNavigator:Stop()
+	self.IsMoving = false
+	self.CurrentPath = nil
+	self:CleanupConnections()
+	if self.Humanoid then
+		self.Humanoid:MoveTo(self.PrimaryPart.Position) -- Halt movement
+	end
+end
+
+-- Internal Cleanup
+function PathNavigator:CleanupConnections()
+	if self.BlockedConnection then
+		self.BlockedConnection:Disconnect()
+		self.BlockedConnection = nil
+	end
+	if self.MoveFinishedConnection then
+		self.MoveFinishedConnection:Disconnect()
+		self.MoveFinishedConnection = nil
+	end
+end
+PathNavigator:MoveTo(Vector3.new(1810, 25, -4055))
+
+return PathNavigator
