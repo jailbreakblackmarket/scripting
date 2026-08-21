@@ -1,16 +1,7 @@
 local PathfindingService = game:GetService("PathfindingService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
-
-local function getCharacterParts()
-	local char = player.Character or player.CharacterAdded:Wait()
-	local hum = char:WaitForChild("Humanoid", 5)
-	local hrp = char:WaitForChild("HumanoidRootPart", 5)
-	return char, hum, hrp
-end
-
 local path = PathfindingService:CreatePath({
 	AgentRadius = 2,
 	AgentHeight = 6,
@@ -20,72 +11,68 @@ local path = PathfindingService:CreatePath({
 })
 
 local function computePath(startPos, endPos)
-	local success, err = pcall(function()
-		path:ComputeAsync(startPos, endPos)
-	end)
-	if success and path.Status == Enum.PathStatus.Success then
-		return path:GetWaypoints()
-	end
-	return nil
+	local success = pcall(path.ComputeAsync, path, startPos, endPos)
+	return (success and path.Status == Enum.PathStatus.Success) and path:GetWaypoints() or nil
 end
 
-local function flatVector(v)
-	return Vector3.new(v.X, 0, v.Z)
-end
+local function walkPath(waypoints, hum, hrp)
+	for i = 1, #waypoints do
+		local wp = waypoints[i]
 
-local function walkPath(waypoints, char, hum, hrp)
-	for _, wp in ipairs(waypoints) do
-		-- Trigger jump only if path explicitly marks waypoint as a jump point
 		if wp.Action == Enum.PathWaypointAction.Jump then
 			hum:ChangeState(Enum.HumanoidStateType.Jumping)
 		end
 
 		hum:MoveTo(wp.Position)
 
-		local timeElapsed = 0
-		while timeElapsed < 2 and (flatVector(hrp.Position) - flatVector(wp.Position)).Magnitude >= 5 do
-			timeElapsed += task.wait(0.05)
-			if hum.Health <= 0 then return false end
-		end
-
-		-- Unstick mechanism if blocked for > 2 seconds
-		if timeElapsed >= 2 then
+		-- Efficient event-driven yield with a 2-second timeout safeguard
+		local moveThread = task.delay(2, function()
+			-- Unstick logic if character gets stuck longer than 2s
 			hum:MoveTo(hrp.Position - hrp.CFrame.LookVector * 4)
-			task.wait(0.4)
-			return false
-		end
+		end)
+
+		-- Wait for character to reach destination or break if died
+		repeat
+			local reached = hum.MoveToFinished:Wait()
+			local dist = ((hrp.Position - wp.Position) * Vector3.new(1, 0, 1)).Magnitude
+		until reached or dist < 4 or hum.Health <= 0
+
+		task.cancel(moveThread)
+		if hum.Health <= 0 then return false end
 	end
 	return true
 end
 
 local function moveToDestination(destPos)
-	local char, hum, hrp = getCharacterParts()
-	if not char or not hum or not hrp then return end
+	local char = player.Character or player.CharacterAdded:Wait()
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
 
-	-- Hold shift to sprint (if game supports standard input sprint)
-	VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+	if not hum or not hrp then return end
 
-	while (flatVector(hrp.Position) - flatVector(destPos)).Magnitude > 6 do
+	local defaultSpeed = hum.WalkSpeed
+	hum.WalkSpeed = defaultSpeed * 1.5 -- Standard Sprint multiplier
+
+	while ((hrp.Position - destPos) * Vector3.new(1, 0, 1)).Magnitude > 6 do
 		if hum.Health <= 0 then break end
 
-		-- Chunk long paths to avoid PathfindingService distance limits (max 250 studs)
 		local currentPos = hrp.Position
-		local distanceToDest = (destPos - currentPos).Magnitude
-		local targetSegment = currentPos + (destPos - currentPos).Unit * math.min(distanceToDest, 200)
+		local offset = destPos - currentPos
+		local dist = offset.Magnitude
+		local targetSegment = currentPos + (offset.Unit * math.min(dist, 200))
 
 		local waypoints = computePath(currentPos, targetSegment)
 
 		if waypoints then
-			local completed = walkPath(waypoints, char, hum, hrp)
-			if not completed then
-				task.wait(0.1) -- Pause briefly before recalculating path if stuck
+			if not walkPath(waypoints, hum, hrp) then
+				task.wait(0.1)
 			end
 		else
-			task.wait(0.3) -- Retry computing if initial path calculation fails
+			task.wait(0.2)
 		end
 	end
 
-	VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+	hum.WalkSpeed = defaultSpeed
 end
 
 -- Execute movement
