@@ -30,6 +30,162 @@ function PathNavigator.new(character)
     return self
 end
 
+function PathNavigator:MoveTo(destination: Vector3)
+    self:Stop()
+    
+    self.CurrentDestination = destination
+    self.IsMoving = true
+
+    local path = PathfindingService:CreatePath(AGENT_PARAMS)
+    self.CurrentPath = path
+
+    local success, errorMessage = pcall(function()
+        path:ComputeAsync(self.PrimaryPart.Position, destination)
+    end)
+
+    if not success or path.Status ~= Enum.PathStatus.Success then
+        warn("[PathNavigator] Path computation failed: " .. tostring(errorMessage or path.Status))
+        self.IsMoving = false
+        return false
+    end
+
+    local waypoints = path:GetWaypoints()
+    self.CurrentWaypointIndex = 1
+
+    self.BlockedConnection = path.Blocked:Connect(function(blockedWaypointIndex)
+        if blockedWaypointIndex >= self.CurrentWaypointIndex and self.IsMoving then
+            warn("[PathNavigator] Path blocked at waypoint " .. blockedWaypointIndex .. ". Recalculating...")
+            self:Stop()
+            task.defer(function()
+                if self.CurrentDestination then
+                    self:MoveTo(self.CurrentDestination)
+                end
+            end)
+        end
+    end)
+
+    task.spawn(function()
+        for index, waypoint in ipairs(waypoints) do
+            if not self.IsMoving or self.CurrentPath ~= path then
+                break
+            end
+
+            self.CurrentWaypointIndex = index
+
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                self.Humanoid.Jump = true
+            end
+
+            self.Humanoid:MoveTo(waypoint.Position)
+
+            local reached = self:_waitForMoveToFinished(8)
+            if not reached then
+                if self.IsMoving and self.CurrentPath == path then
+                    warn("[PathNavigator] Timeout reached at waypoint " .. index .. ". Recalculating...")
+                    self:Stop()
+                    task.defer(function()
+                        if self.CurrentDestination then
+                            self:MoveTo(self.CurrentDestination)
+                        end
+                    end)
+                end
+                break
+            end
+        end
+
+        if self.CurrentPath == path then
+            self:CleanupConnections()
+            self.IsMoving = false
+        end
+    end)
+
+    return true
+end
+
+function PathNavigator:_waitForMoveToFinished(timeout: number): boolean
+    local bindable = Instance.new("BindableEvent")
+    local completed = false
+    local conn
+
+    conn = self.Humanoid.MoveToFinished:Connect(function(reached)
+        completed = reached
+        bindable:Fire()
+    end)
+
+    local delayThread = task.delay(timeout, function()
+        if conn.Connected then
+            completed = false
+            bindable:Fire()
+        end
+    end)
+
+    bindable.Event:Wait()
+    
+    conn:Disconnect()
+    bindable:Destroy()
+    
+    if coroutine.status(delayThread) ~= "dead" then
+        task.cancel(delayThread)
+    end
+
+    return completed
+end
+
+function PathNavigator:Stop()
+    self.IsMoving = false
+    self.CurrentPath = nil
+    self:CleanupConnections()
+    
+    if self.Humanoid and self.PrimaryPart then
+        self.Humanoid:MoveTo(self.PrimaryPart.Position)
+    end
+end
+
+function PathNavigator:CleanupConnections()
+    if self.BlockedConnection then
+        self.BlockedConnection:Disconnect()
+        self.BlockedConnection = nil
+    end
+end
+
+-- ==========================================
+-- EXECUTION (Remplace "MyNPC" par ton personnage)
+-- ==========================================
+local character = workspace:WaitForChild("MyNPC") -- Ou game.Players.LocalPlayer.Character
+local navigator = PathNavigator.new(character)
+
+navigator:MoveTo(Vector3.new(1810, 25, -4055))-- Services
+local PathfindingService = game:GetService("PathfindingService")
+
+-- Configuration Parameters
+local AGENT_PARAMS = {
+    AgentRadius = 2,
+    AgentHeight = 5,
+    AgentCanJump = true,
+    Costs = {
+        Water = math.huge,
+    }
+}
+
+-- Path Navigator Class
+local PathNavigator = {}
+PathNavigator.__index = PathNavigator
+
+function PathNavigator.new(character)
+    local self = setmetatable({}, PathNavigator)
+    self.Character = character
+    self.Humanoid = character:WaitForChild("Humanoid")
+    self.PrimaryPart = character.PrimaryPart or character:WaitForChild("HumanoidRootPart")
+    
+    self.CurrentPath = nil
+    self.BlockedConnection = nil
+    self.CurrentWaypointIndex = 1
+    self.IsMoving = false
+    self.CurrentDestination = nil
+    
+    return self
+end
+
 -- Core Function: Move to Destination
 function PathNavigator:MoveTo(destination: Vector3)
     self:Stop() -- Annule la navigation en cours et nettoie les connexions
