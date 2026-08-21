@@ -1,120 +1,138 @@
-local P = game:GetService("PathfindingService")
-local V = game:GetService("VirtualInputManager")
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 local Players = game:GetService("Players")
 
-local p = Players.LocalPlayer
-local c = p.Character or p.CharacterAdded:Wait()
-local h = c:WaitForChild("Humanoid") :: Humanoid
-local r = c:WaitForChild("HumanoidRootPart") :: BasePart
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid") :: Humanoid
+local rootPart = character:WaitForChild("HumanoidRootPart") :: BasePart
 
-    local MAX_CHUNK_DISTANCE = 500
+local CHUNK_DISTANCE = 250
 
-local path = P:CreatePath({
-    AgentRadius = 2,
+-- Main precise path generator
+local path = PathfindingService:CreatePath({
+    AgentRadius = 3,
     AgentHeight = 8,
     AgentCanJump = true,
     AgentJumpHeight = 7,
     Costs = { Water = 1000 }
 })
 
--- Navigates a single path segment without distance chunking
-local function navigateSegment(startPos: Vector3, targetPos: Vector3, attempt: number): boolean
-    attempt = attempt or 1
-    if attempt > 3 then
-        warn(string.format("[Path] Max retry attempts reached for target %s", tostring(targetPos)))
-        return false
+-- Low-cost path generator for long-range target discovery
+local longPath = PathfindingService:CreatePath({
+    AgentRadius = 6,
+    AgentHeight = 8,
+    AgentCanJump = true,
+    Costs = { Water = 1000 }
+})
+
+local function safeComputePath(pathObj, startPos: Vector3, endPos: Vector3)
+    local success, _ = pcall(function()
+        pathObj:ComputeAsync(startPos, endPos)
+    end)
+    if success and pathObj.Status == Enum.PathStatus.Success then
+        return pathObj:GetWaypoints()
+    end
+    return nil
+end
+
+-- Extracts a sub-target along the coarse route instead of raw Vector lerping
+local function getNavigableSubTarget(startPos: Vector3, finalDestination: Vector3): Vector3
+    local coarseWaypoints = safeComputePath(longPath, startPos, finalDestination)
+    
+    if not coarseWaypoints or #coarseWaypoints == 0 then
+        -- Fallback to direct target if coarse path fails
+        return finalDestination
     end
 
-    print(string.format("[Path] Computing segment (Attempt %d): %s -> %s", attempt, tostring(startPos), tostring(targetPos)))
-
-    local ok, err = pcall(function() path:ComputeAsync(startPos, targetPos) end)
-    if not ok then
-        warn("[Path] ComputeAsync error:", err)
-        return false
+    local accumulatedDist = 0
+    for i = 1, #coarseWaypoints - 1 do
+        local p1 = coarseWaypoints[i].Position
+        local p2 = coarseWaypoints[i + 1].Position
+        local legDist = (p2 - p1).Magnitude
+        
+        if accumulatedDist + legDist >= CHUNK_DISTANCE then
+            local remaining = CHUNK_DISTANCE - accumulatedDist
+            return p1:Lerp(p2, remaining / legDist)
+        end
+        accumulatedDist += legDist
     end
 
-    if path.Status ~= Enum.PathStatus.Success then
-        warn("[Path] Computation status failed:", path.Status.Name)
-        return false
-    end
+    return coarseWaypoints[#coarseWaypoints].Position
+end
 
-    local waypoints = path:GetWaypoints()
-    print(string.format("[Path] Calculated %d waypoints for segment.", #waypoints))
+local function walkWaypoints(waypoints): boolean
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
 
-    V:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
-
-    for i, w in ipairs(waypoints) do
-        -- Handle jumps with height safety check
-        if w.Action == Enum.PathWaypointAction.Jump then
+    for i, wp in ipairs(waypoints) do
+        -- Jump handling with overhead clearance check
+        if wp.Action == Enum.PathWaypointAction.Jump then
             local rp = RaycastParams.new()
-            rp.FilterDescendantsInstances = {c}
+            rp.FilterDescendantsInstances = {character}
             rp.FilterType = Enum.RaycastFilterType.Exclude
 
-            local ray = workspace:Raycast(r.Position, Vector3.new(0, 6, 0), rp)
+            local ray = workspace:Raycast(rootPart.Position, Vector3.new(0, 6, 0), rp)
             if not ray then
-                print(string.format("[Path] Waypoint %d: Jumping", i))
-                h:ChangeState(Enum.HumanoidStateType.Jumping)
-            else
-                print(string.format("[Path] Waypoint %d: Jump skipped (obstacle overhead: %s)", i, ray.Instance.Name))
+                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
             end
         end
 
-        h:MoveTo(w.Position)
+        humanoid:MoveTo(wp.Position)
 
-        -- Timeout and stuck detection logic
-        local timeElapsed = 0
         local reached = false
-        
-        while timeElapsed < 3 do
-            local distanceFlat = (Vector3.new(r.Position.X, 0, r.Position.Z) - Vector3.new(w.Position.X, 0, w.Position.Z)).Magnitude
-            if distanceFlat < 5 then
+        local timeout = 0
+        while timeout < 3 do
+            local distFlat = (Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z) - Vector3.new(wp.Position.X, 0, wp.Position.Z)).Magnitude
+            if distFlat < 4.5 then
                 reached = true
                 break
             end
-            timeElapsed += task.wait(0.05)
+            timeout += task.wait(0.05)
         end
 
+        -- Un-stuck / Backtrack routine
         if not reached then
-            warn(string.format("[Path] Stuck at waypoint %d/%d (Pos: %s) - Retrying segment...", i, #waypoints, tostring(w.Position)))
-            
-            -- Backtrack maneuver
-            h:MoveTo(r.Position - r.CFrame.LookVector * 4)
+            warn(string.format("[Path] Stuck at waypoint %d/%d. Executing backtrack...", i, #waypoints))
+            humanoid:MoveTo(rootPart.Position - rootPart.CFrame.LookVector * 5)
             task.wait(0.4)
-            
-            V:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
-            return navigateSegment(r.Position, targetPos, attempt + 1)
-        end
-    end
-
-    print("[Path] Segment reached successfully.")
-    return true
-end
-
--- Divides paths > 1000 studs into smaller targets
-local function moveToDestination(finalTarget: Vector3)
-    local startPos = r.Position
-    local totalDistance = (finalTarget - startPos).Magnitude
-    local chunkCount = math.ceil(totalDistance / MAX_CHUNK_DISTANCE)
-
-    print(string.format("[Path] Starting travel to %s | Total Distance: %.1f studs | Chunks: %d", tostring(finalTarget), totalDistance, chunkCount))
-
-    for chunkIdx = 1, chunkCount do
-        local alpha = math.min(1, chunkIdx / chunkCount)
-        local chunkTarget = startPos:Lerp(finalTarget, alpha)
-
-        print(string.format("[Path] --- Processing Chunk %d/%d (Target: %s) ---", chunkIdx, chunkCount, tostring(chunkTarget)))
-
-        local success = navigateSegment(r.Position, chunkTarget)
-        if not success then
-            warn(string.format("[Path] Failed to complete chunk %d/%d. Aborting traversal.", chunkIdx, chunkCount))
-            V:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
             return false
         end
     end
 
-    V:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
-    print("[Path] Destination reached successfully!")
     return true
 end
 
-moveToDestination(Vector3.new(2210, 27.5, -4170))
+local function traverseLongDistance(finalDestination: Vector3)
+    while (Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z) - Vector3.new(finalDestination.X, 0, finalDestination.Z)).Magnitude > 6 do
+        
+        local subTarget = getNavigableSubTarget(rootPart.Position, finalDestination)
+        local currentWaypoints = safeComputePath(path, rootPart.Position, subTarget)
+
+        if not currentWaypoints then
+            warn("[Path] Could not compute segment. Retrying in 1s...")
+            task.wait(1)
+            continue
+        end
+
+        -- Pre-fetch next target asynchronously mid-way through current execution
+        local nextSubTarget = nil
+        local prefetchThread = task.spawn(function()
+            task.wait(0.2) -- Small delay to avoid API throttling
+            nextSubTarget = getNavigableSubTarget(subTarget, finalDestination)
+        end)
+
+        local success = walkWaypoints(currentWaypoints)
+        if not success then
+            warn("[Path] Segment failed. Recalculating route from current position...")
+            task.wait(0.2)
+        end
+    end
+
+    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+    print("[Path] Long distance traversal completed successfully!")
+    return true
+end
+
+-- Run Traversal
+traverseLongDistance(Vector3.new(2210, 27.5, -4170))
