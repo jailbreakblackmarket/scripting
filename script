@@ -1,39 +1,92 @@
-local P, V, p = game:GetService("PathfindingService"), game:GetService("VirtualInputManager"), game:GetService("Players").LocalPlayer
-local c = p.Character or p.CharacterAdded:Wait()
-local h, r = c:WaitForChild("Humanoid"), c:WaitForChild("HumanoidRootPart")
-local path = P:CreatePath({AgentRadius = 2, AgentHeight = 6, AgentCanJump = true, AgentJumpHeight = 6.37, Costs = {Water = 1000}})
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local Players = game:GetService("Players")
 
-local function comp(a, b) return pcall(function() path:ComputeAsync(a, b) end) and path.Status == Enum.PathStatus.Success and path:GetWaypoints() end
-local function flat(v) return Vector3.new(v.X, 0, v.Z) end
+local player = Players.LocalPlayer
 
-local function walk(wps)
-    for _, w in ipairs(wps) do
-        local rp = RaycastParams.new()
-        rp.FilterDescendantsInstances, rp.FilterType = {c}, Enum.RaycastFilterType.Exclude
-        if not workspace:Raycast(r.Position, Vector3.new(0, 6.5, 0), rp) then h:ChangeState(Enum.HumanoidStateType.Jumping) end
-        h:MoveTo(w.Position)
-        local t = 0
-        while t < 2 and (flat(r.Position) - flat(w.Position)).Magnitude >= 5 do t += task.wait(0.05) end
-        if t >= 2 then h:MoveTo(r.Position - r.CFrame.LookVector * 4) task.wait(0.4) return end
-    end
-    return true
+local function getCharacterParts()
+	local char = player.Character or player.CharacterAdded:Wait()
+	local hum = char:WaitForChild("Humanoid", 5)
+	local hrp = char:WaitForChild("HumanoidRootPart", 5)
+	return char, hum, hrp
 end
 
-local function moveToDestination(dest)
-    V:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
-    local gt = function(p) return p + (dest - p).Unit * math.min((dest - p).Magnitude, 250) end
-    local curT, curW = gt(r.Position), comp(r.Position, gt(r.Position))
+local path = PathfindingService:CreatePath({
+	AgentRadius = 2,
+	AgentHeight = 6,
+	AgentCanJump = true,
+	AgentJumpHeight = 6.37,
+	Costs = { Water = 1000 }
+})
 
-    while (flat(r.Position) - flat(dest)).Magnitude > 6 do
-        if not curW then task.wait(0.5) curT = gt(r.Position) curW = comp(r.Position, curT) continue end
-        local nxtW
-        task.spawn(function() if (dest - curT).Magnitude > 6 then nxtW = comp(curT, gt(curT)) end end)
-        if walk(curW) then
-            while not nxtW and (dest - curT).Magnitude > 6 do task.wait(0.05) end
-            curT, curW = gt(r.Position), nxtW
-        else curW = nil task.wait(0.2) end
-    end
-    V:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+local function computePath(startPos, endPos)
+	local success, err = pcall(function()
+		path:ComputeAsync(startPos, endPos)
+	end)
+	if success and path.Status == Enum.PathStatus.Success then
+		return path:GetWaypoints()
+	end
+	return nil
 end
 
+local function flatVector(v)
+	return Vector3.new(v.X, 0, v.Z)
+end
+
+local function walkPath(waypoints, char, hum, hrp)
+	for _, wp in ipairs(waypoints) do
+		-- Trigger jump only if path explicitly marks waypoint as a jump point
+		if wp.Action == Enum.PathWaypointAction.Jump then
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+
+		hum:MoveTo(wp.Position)
+
+		local timeElapsed = 0
+		while timeElapsed < 2 and (flatVector(hrp.Position) - flatVector(wp.Position)).Magnitude >= 5 do
+			timeElapsed += task.wait(0.05)
+			if hum.Health <= 0 then return false end
+		end
+
+		-- Unstick mechanism if blocked for > 2 seconds
+		if timeElapsed >= 2 then
+			hum:MoveTo(hrp.Position - hrp.CFrame.LookVector * 4)
+			task.wait(0.4)
+			return false
+		end
+	end
+	return true
+end
+
+local function moveToDestination(destPos)
+	local char, hum, hrp = getCharacterParts()
+	if not char or not hum or not hrp then return end
+
+	-- Hold shift to sprint (if game supports standard input sprint)
+	VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+
+	while (flatVector(hrp.Position) - flatVector(destPos)).Magnitude > 6 do
+		if hum.Health <= 0 then break end
+
+		-- Chunk long paths to avoid PathfindingService distance limits (max 250 studs)
+		local currentPos = hrp.Position
+		local distanceToDest = (destPos - currentPos).Magnitude
+		local targetSegment = currentPos + (destPos - currentPos).Unit * math.min(distanceToDest, 200)
+
+		local waypoints = computePath(currentPos, targetSegment)
+
+		if waypoints then
+			local completed = walkPath(waypoints, char, hum, hrp)
+			if not completed then
+				task.wait(0.1) -- Pause briefly before recalculating path if stuck
+			end
+		else
+			task.wait(0.3) -- Retry computing if initial path calculation fails
+		end
+	end
+
+	VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+end
+
+-- Execute movement
 moveToDestination(Vector3.new(2210, 27.5, -4170))
