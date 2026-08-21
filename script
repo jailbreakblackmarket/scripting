@@ -1,5 +1,147 @@
 -- Services
 local PathfindingService = game:GetService("PathfindingService")
+local Players = game:GetService("Players")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then return end
+
+-- Configuration Parameters
+local AGENT_PARAMS = {
+    AgentRadius = 2,
+    AgentHeight = 5,
+    AgentCanJump = true,
+    Costs = {
+        Water = math.huge,
+    }
+}
+
+-- Path Navigator Class
+local PathNavigator = {}
+PathNavigator.__index = PathNavigator
+
+function PathNavigator.new(character)
+    local self = setmetatable({}, PathNavigator)
+    self.Character = character
+    self.Humanoid = character:WaitForChild("Humanoid")
+    self.PrimaryPart = character.PrimaryPart or character:WaitForChild("HumanoidRootPart")
+    
+    self.CurrentPath = nil
+    self.BlockedConnection = nil
+    self.CurrentWaypointIndex = 1
+    self.IsMoving = false
+    self.CurrentDestination = nil
+    
+    return self
+end
+
+function PathNavigator:MoveTo(destination: Vector3)
+    self:Stop()
+    
+    self.CurrentDestination = destination
+    self.IsMoving = true
+
+    local path = PathfindingService:CreatePath(AGENT_PARAMS)
+    self.CurrentPath = path
+
+    local success, errorMessage = pcall(function()
+        path:ComputeAsync(self.PrimaryPart.Position, destination)
+    end)
+
+    if not success or path.Status ~= Enum.PathStatus.Success then
+        warn("[PathNavigator] Path computation failed: " .. tostring(errorMessage or path.Status))
+        self.IsMoving = false
+        return false
+    end
+
+    local waypoints = path:GetWaypoints()
+    self.CurrentWaypointIndex = 1
+
+    -- Listener de blocage
+    self.BlockedConnection = path.Blocked:Connect(function(blockedWaypointIndex)
+        if blockedWaypointIndex >= self.CurrentWaypointIndex and self.IsMoving then
+            warn("[PathNavigator] Path blocked. Recalculating...")
+            self:Stop()
+            task.defer(function()
+                if self.CurrentDestination then
+                    self:MoveTo(self.CurrentDestination)
+                end
+            end)
+        end
+    end)
+
+    -- Déplacement
+    task.spawn(function()
+        for index, waypoint in ipairs(waypoints) do
+            if not self.IsMoving or self.CurrentPath ~= path then
+                break
+            end
+
+            self.CurrentWaypointIndex = index
+
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                self.Humanoid.Jump = true
+            end
+
+            self.Humanoid:MoveTo(waypoint.Position)
+
+            -- Attente sécurisée basée sur la distance (très fiable sur exécuteur)
+            local startTime = tick()
+            while self.IsMoving and self.CurrentPath == path do
+                local distance = (self.PrimaryPart.Position - waypoint.Position).Magnitude
+                if distance <= 4 then
+                    break -- Waypoint atteint
+                end
+
+                if tick() - startTime > 6 then
+                    -- Timeout : obstacle ou blocage
+                    warn("[PathNavigator] Waypoint timeout. Recalculating...")
+                    self:Stop()
+                    task.defer(function()
+                        if self.CurrentDestination then
+                            self:MoveTo(self.CurrentDestination)
+                        end
+                    end)
+                    return
+                end
+                task.wait()
+            end
+        end
+
+        if self.CurrentPath == path then
+            self:CleanupConnections()
+            self.IsMoving = false
+        end
+    end)
+
+    return true
+end
+
+function PathNavigator:Stop()
+    self.IsMoving = false
+    self.CurrentPath = nil
+    self:CleanupConnections()
+    
+    if self.Humanoid and self.PrimaryPart then
+        self.Humanoid:MoveTo(self.PrimaryPart.Position)
+    end
+end
+
+function PathNavigator:CleanupConnections()
+    if self.BlockedConnection then
+        self.BlockedConnection:Disconnect()
+        self.BlockedConnection = nil
+    end
+end
+
+-- ==========================================
+-- EXECUTION CLIENT (Joueur Local)
+-- ==========================================
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local navigator = PathNavigator.new(character)
+
+-- Coordonnées demandées :
+navigator:MoveTo(Vector3.new(1810, 25, -4055))-- Services
+local PathfindingService = game:GetService("PathfindingService")
 
 -- Configuration Parameters
 local AGENT_PARAMS = {
