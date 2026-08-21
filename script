@@ -2,6 +2,7 @@ local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
+
 local path = PathfindingService:CreatePath({
 	AgentRadius = 2,
 	AgentHeight = 6,
@@ -10,70 +11,71 @@ local path = PathfindingService:CreatePath({
 	Costs = { Water = 1000 }
 })
 
-local function computePath(startPos, endPos)
-	local success = pcall(path.ComputeAsync, path, startPos, endPos)
-	return (success and path.Status == Enum.PathStatus.Success) and path:GetWaypoints() or nil
+local raycastParams = RaycastParams.new()
+raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- Calculate flat 2D distance squared (avoids expensive math.sqrt)
+local function flatDistanceSq(v1, v2)
+	local dx = v1.X - v2.X
+	local dz = v1.Z - v2.Z
+	return (dx * dx) + (dz * dz)
 end
 
-local function walkPath(waypoints, hum, hrp)
-	for i = 1, #waypoints do
-		local wp = waypoints[i]
+-- Checks if character can walk directly to a point without hitting walls
+local function hasLineOfSight(startPos, endPos, character)
+	raycastParams.FilterDescendantsInstances = {character}
+	local direction = endPos - startPos
+	local result = workspace:Raycast(startPos, direction, raycastParams)
+	return result == nil
+end
 
-		if wp.Action == Enum.PathWaypointAction.Jump then
+local function navigateStaticPath(destPos)
+	local char = player.Character or player.CharacterAdded:Wait()
+	local hum = char:WaitForChild("Humanoid")
+	local hrp = char:WaitForChild("HumanoidRootPart")
+
+	-- Compute full path ONCE at start
+	local success = pcall(path.ComputeAsync, path, hrp.Position, destPos)
+	if not success or path.Status ~= Enum.PathStatus.Success then return end
+
+	local waypoints = path:GetWaypoints()
+	local totalWaypoints = #waypoints
+	if totalWaypoints == 0 then return end
+
+	local currentIndex = 1
+
+	while currentIndex <= totalWaypoints do
+		if hum.Health <= 0 then break end
+
+		-- PATH SMOOTHING: Look ahead to skip unnecessary waypoints if line of sight is clear
+		local targetIndex = currentIndex
+		for lookAhead = math.min(currentIndex + 4, totalWaypoints), currentIndex + 1, -1 do
+			if waypoints[lookAhead].Action ~= Enum.PathWaypointAction.Jump then
+				if hasLineOfSight(hrp.Position, waypoints[lookAhead].Position, char) then
+					targetIndex = lookAhead
+					break
+				end
+			end
+		end
+
+		currentIndex = targetIndex
+		local currentWP = waypoints[currentIndex]
+
+		if currentWP.Action == Enum.PathWaypointAction.Jump then
 			hum:ChangeState(Enum.HumanoidStateType.Jumping)
 		end
 
-		hum:MoveTo(wp.Position)
+		hum:MoveTo(currentWP.Position)
 
-		-- Efficient event-driven yield with a 2-second timeout safeguard
-		local moveThread = task.delay(2, function()
-			-- Unstick logic if character gets stuck longer than 2s
-			hum:MoveTo(hrp.Position - hrp.CFrame.LookVector * 4)
-		end)
-
-		-- Wait for character to reach destination or break if died
-		repeat
-			local reached = hum.MoveToFinished:Wait()
-			local dist = ((hrp.Position - wp.Position) * Vector3.new(1, 0, 1)).Magnitude
-		until reached or dist < 4 or hum.Health <= 0
-
-		task.cancel(moveThread)
-		if hum.Health <= 0 then return false end
-	end
-	return true
-end
-
-local function moveToDestination(destPos)
-	local char = player.Character or player.CharacterAdded:Wait()
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-
-	if not hum or not hrp then return end
-
-	local defaultSpeed = hum.WalkSpeed
-	hum.WalkSpeed = defaultSpeed * 1.5 -- Standard Sprint multiplier
-
-	while ((hrp.Position - destPos) * Vector3.new(1, 0, 1)).Magnitude > 6 do
-		if hum.Health <= 0 then break end
-
-		local currentPos = hrp.Position
-		local offset = destPos - currentPos
-		local dist = offset.Magnitude
-		local targetSegment = currentPos + (offset.Unit * math.min(dist, 200))
-
-		local waypoints = computePath(currentPos, targetSegment)
-
-		if waypoints then
-			if not walkPath(waypoints, hum, hrp) then
-				task.wait(0.1)
-			end
-		else
-			task.wait(0.2)
+		-- Wait until close enough to waypoint (using 16 = 4^2 studs squared distance)
+		while flatDistanceSq(hrp.Position, currentWP.Position) > 16 do
+			if hum.Health <= 0 then return end
+			task.wait(0.03) -- Low overhead check interval
 		end
-	end
 
-	hum.WalkSpeed = defaultSpeed
+		currentIndex += 1
+	end
 end
 
--- Execute movement
-moveToDestination(Vector3.new(2210, 27.5, -4170))
+-- Run static navigation
+navigateStaticPath(Vector3.new(2210, 27.5, -4170))
