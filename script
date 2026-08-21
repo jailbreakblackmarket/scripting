@@ -14,6 +14,139 @@ local path = PathfindingService:CreatePath({
 local raycastParams = RaycastParams.new()
 raycastParams.FilterType = Enum.RaycastFilterType.Exclude
 
+-- Visualizer Setup Folder
+local debugFolder = workspace:FindFirstChild("PathDebugFolder") or Instance.new("Folder")
+debugFolder.Name = "PathDebugFolder"
+debugFolder.Parent = workspace
+
+local function clearDebugVisuals()
+	debugFolder:ClearAllChildren()
+end
+
+-- Renders a sphere at a waypoint position
+local function createWaypointMarker(pos, isSmoothed)
+	local sphere = Instance.new("Part")
+	sphere.Shape = Enum.PartType.Ball
+	sphere.Size = Vector3.new(1, 1, 1)
+	sphere.Position = pos
+	sphere.Anchored = true
+	sphere.CanCollide = false
+	sphere.Material = Enum.Material.Neon
+	sphere.Color = isSmoothed and Color3.fromRGB(0, 255, 127) or Color3.fromRGB(255, 60, 60)
+	sphere.Transparency = isSmoothed and 0.2 or 0.6
+	sphere.Parent = debugFolder
+end
+
+-- Draws a neon cylinder line connecting two points
+local function createPathLine(startPos, endPos)
+	local distance = (startPos - endPos).Magnitude
+	local line = Instance.new("Part")
+	line.Size = Vector3.new(0.3, 0.3, distance)
+	line.CFrame = CFrame.lookAt(startPos, endPos) * CFrame.new(0, 0, -distance / 2)
+	line.Anchored = true
+	line.CanCollide = false
+	line.Material = Enum.Material.Neon
+	line.Color = Color3.fromRGB(0, 255, 127)
+	line.Parent = debugFolder
+end
+
+-- 2D Squared distance comparison
+local function flatDistanceSq(v1, v2)
+	local dx, dz = v1.X - v2.X, v1.Z - v2.Z
+	return (dx * dx) + (dz * dz)
+end
+
+-- Line-of-sight raycast check
+local function hasLineOfSight(startPos, endPos, character)
+	raycastParams.FilterDescendantsInstances = {character, debugFolder}
+	local direction = endPos - startPos
+	return workspace:Raycast(startPos, direction, raycastParams) == nil
+end
+
+local function navigateWithVisuals(destPos)
+	clearDebugVisuals()
+
+	local char = player.Character or player.CharacterAdded:Wait()
+	local hum = char:WaitForChild("Humanoid")
+	local hrp = char:WaitForChild("HumanoidRootPart")
+
+	-- Compute static path
+	local success = pcall(path.ComputeAsync, path, hrp.Position, destPos)
+	if not success or path.Status ~= Enum.PathStatus.Success then return end
+
+	local waypoints = path:GetWaypoints()
+	local totalWaypoints = #waypoints
+	if totalWaypoints == 0 then return end
+
+	-- Draw initial raw waypoints
+	for _, wp in ipairs(waypoints) do
+		createWaypointMarker(wp.Position, false)
+	end
+
+	local currentIndex = 1
+	local previousPosition = hrp.Position
+
+	while currentIndex <= totalWaypoints do
+		if hum.Health <= 0 then break end
+
+		-- Lookahead Raycasting (Path Smoothing)
+		local targetIndex = currentIndex
+		for lookAhead = math.min(currentIndex + 4, totalWaypoints), currentIndex + 1, -1 do
+			if waypoints[lookAhead].Action ~= Enum.PathWaypointAction.Jump then
+				if hasLineOfSight(hrp.Position, waypoints[lookAhead].Position, char) then
+					targetIndex = lookAhead
+					break
+				end
+			end
+		end
+
+		currentIndex = targetIndex
+		local currentWP = waypoints[currentIndex]
+
+		-- Visualize active smoothed step
+		createWaypointMarker(currentWP.Position, true)
+		createPathLine(previousPosition, currentWP.Position)
+		previousPosition = currentWP.Position
+
+		if currentWP.Action == Enum.PathWaypointAction.Jump then
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+
+		hum:MoveTo(currentWP.Position)
+
+		-- Wait until character reaches waypoint target (squared distance threshold 16)
+		while flatDistanceSq(hrp.Position, currentWP.Position) > 16 do
+			if hum.Health <= 0 then
+				clearDebugVisuals()
+				return
+			end
+			task.wait(0.03)
+		end
+
+		currentIndex += 1
+	end
+
+	-- Fade out debug visuals after arriving
+	task.delay(3, clearDebugVisuals)
+end
+
+-- Run navigation with debug lines
+navigateWithVisuals(Vector3.new(2210, 27.5, -4170))local PathfindingService = game:GetService("PathfindingService")
+local Players = game:GetService("Players")
+
+local player = Players.LocalPlayer
+
+local path = PathfindingService:CreatePath({
+	AgentRadius = 2,
+	AgentHeight = 6,
+	AgentCanJump = true,
+	AgentJumpHeight = 6.37,
+	Costs = { Water = 1000 }
+})
+
+local raycastParams = RaycastParams.new()
+raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
 -- Calculate flat 2D distance squared (avoids expensive math.sqrt)
 local function flatDistanceSq(v1, v2)
 	local dx = v1.X - v2.X
