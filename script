@@ -1,171 +1,110 @@
-local PathfindingService = game:GetService("PathfindingService")
-local Players = game:GetService("Players")
+local P, p, RS = game:GetService("PathfindingService"), game:GetService("Players").LocalPlayer, game:GetService("ReplicatedStorage")
 
-local player = Players.LocalPlayer
+print("[DEBUG] Script initialized.")
 
--- Base path params (High water cost to prioritize bridges/land)
-local pathParams = {
-	AgentRadius = 3,
-	AgentHeight = 6,
-	AgentCanJump = true,
-	AgentJumpHeight = 7,
-	Costs = { Water = 100 }
-}
-
-local path = PathfindingService:CreatePath(pathParams)
-
-local raycastParams = RaycastParams.new()
-raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-
--- Visualizer Setup Folder
-local debugFolder = workspace:FindFirstChild("PathDebugFolder") or Instance.new("Folder")
-debugFolder.Name = "PathDebugFolder"
-debugFolder.Parent = workspace
-
-local function clearDebugVisuals()
-	debugFolder:ClearAllChildren()
+-- Helper function to visualize destination points in game
+local function createDebugVisual(position, color)
+    local part = Instance.new("Part")
+    part.Size = Vector3.new(1.5, 0.2, 1.5)
+    part.Position = position
+    part.Anchored = true
+    part.CanCollide = false
+    part.Material = Enum.Material.Neon
+    part.Color = color or Color3.fromRGB(255, 0, 0)
+    part.Parent = workspace
+    game:GetService("Debris"):AddItem(part, 10) -- Cleanup after 10 seconds
 end
 
-local function createWaypointMarker(pos, isSmoothed)
-	local sphere = Instance.new("Part")
-	sphere.Shape = Enum.PartType.Ball
-	sphere.Size = Vector3.new(1.2, 1.2, 1.2)
-	sphere.Position = pos
-	sphere.Anchored = true
-	sphere.CanCollide = false
-	sphere.Material = Enum.Material.Neon
-	sphere.Color = isSmoothed and Color3.fromRGB(0, 255, 127) or Color3.fromRGB(255, 60, 60)
-	sphere.Transparency = isSmoothed and 0.2 or 0.5
-	sphere.Parent = debugFolder
+local char = p.Character or p.CharacterAdded:Wait()
+print("[DEBUG] Character found:", char.Name)
+
+local wp = {{1793, 25, -4110}, {2225, 24, -4050}, {2278, 24, -4110}, {2225, 27, -4165}}
+local root = char:WaitForChild("HumanoidRootPart", 5)
+local hum = char:WaitForChild("Humanoid", 5)
+
+if not root or not hum then 
+    warn("[DEBUG ERROR] HumanoidRootPart or Humanoid missing!")
+    return 
 end
 
-local function createPathLine(startPos, endPos)
-	local distance = (startPos - endPos).Magnitude
-	if distance < 0.1 then return end
+print("[DEBUG] Root & Humanoid validated. Selecting team...")
 
-	local line = Instance.new("Part")
-	line.Size = Vector3.new(0.3, 0.3, distance)
-	line.CFrame = CFrame.lookAt(startPos, endPos) * CFrame.new(0, 0, -distance / 2)
-	line.Anchored = true
-	line.CanCollide = false
-	line.Material = Enum.Material.Neon
-	line.Color = Color3.fromRGB(0, 255, 127)
-	line.Parent = debugFolder
+local gui = p:WaitForChild("PlayerGui"):WaitForChild("TeamSelectGui", 5)
+local btn = gui and gui:FindFirstChild("Police", true)
+if btn and getconnections then
+    print("[DEBUG] Firing police team selection connections...")
+    for _, c in ipairs(getconnections(btn.MouseButton1Click)) do c:Fire() end
+    for _, c in ipairs(getconnections(btn.Activated)) do c:Fire() end
+else
+    warn("[DEBUG WARNING] Police team button or getconnections not found.")
 end
 
-local function flatDistanceSq(v1, v2)
-	local dx, dz = v1.X - v2.X, v1.Z - v2.Z
-	return (dx * dx) + (dz * dz)
+print("[DEBUG] Requesting spawn selection...")
+RS.SpawnSelectionUpdateSpawnData:FireServer()
+RS.SpawnSelectionSelect:FireServer("PoliceOutpost")
+
+-- Wait for respawn/teleport update if team selection triggers a character reload
+char = p.CharacterAdded:Wait()
+root = char:WaitForChild("HumanoidRootPart", 10)
+hum = char:WaitForChild("Humanoid", 10)
+print("[DEBUG] Character loaded at spawn position:", root.Position)
+
+local function walkto(target)
+    print("[DEBUG] Starting walkto target:", target)
+    createDebugVisual(target, Color3.fromRGB(0, 255, 0)) -- Green for walkto points
+    
+    repeat 
+        hum:MoveTo(target) 
+        task.wait(8) 
+        print("[DEBUG] Re-issuing walkto MoveTo. Current distance:", (root.Position - target).Magnitude)
+    until (root.Position - target).Magnitude < 4 or hum.Health <= 0
+    
+    print("[DEBUG] Reached walkto target or died.")
 end
 
--- Thick Spherecast Line-Of-Sight Check
-local function hasLineOfSight(startPos, endPos, character, hum)
-	-- NEVER smooth/shortcut if character is swimming or submerged
-	if hum:GetState() == Enum.HumanoidStateType.Swimming or hum.FloorMaterial == Enum.Material.Water then
-		return false
-	end
-
-	-- Disallow smoothing across large vertical gaps
-	if math.abs(endPos.Y - startPos.Y) > 2.5 then
-		return false
-	end
-
-	raycastParams.FilterDescendantsInstances = {character, debugFolder}
-	local direction = endPos - startPos
-
-	-- Spherecast (1.8 studs radius) prevents cutting through boats/walls
-	local result = workspace:Spherecast(startPos + Vector3.new(0, 1.5, 0), 1.8, direction, raycastParams)
-	return result == nil
+local function walk(target)
+    print("[DEBUG] Starting pathfinding walk target:", target)
+    createDebugVisual(target, Color3.fromRGB(0, 100, 255)) -- Blue for pathfinding final goal
+    
+    local attempts = 0
+    while (root.Position - target).Magnitude > 10 and hum.Health > 0 do
+        attempts = attempts + 1
+        print("[DEBUG] Pathfinding attempt #" .. attempts)
+        
+        local path = P:CreatePath()
+        path:ComputeAsync(root.Position, target)
+        print("[DEBUG] Path status:", path.Status)
+        
+        if path.Status == Enum.PathStatus.Success then
+            local waypoints = path:GetWaypoints()
+            print("[DEBUG] Calculated waypoints count:", #waypoints)
+            
+            for idx, w in ipairs(waypoints) do
+                createDebugVisual(w.Position, Color3.fromRGB(255, 165, 0)) -- Orange for path steps
+                
+                if w.Action == Enum.PathWaypointAction.Jump then 
+                    print("[DEBUG] Jump required at waypoint:", idx)
+                    hum.Jump = true 
+                end
+                
+                hum:MoveTo(w.Position)
+                hum.MoveToFinished:Wait()
+                print("[DEBUG] Reached waypoint:", idx, "/", #waypoints)
+            end
+        else
+            warn("[DEBUG WARNING] Path computation failed! Retrying...")
+            task.wait(1)
+        end
+    end
+    print("[DEBUG] Completed pathfinding walk.")
 end
 
-local function navigateWithVisuals(destPos)
-	clearDebugVisuals()
+print("[DEBUG] Beginning movement sequence...")
+walk(Vector3.new(1793, 25, -4050))
 
-	local char = player.Character or player.CharacterAdded:Wait()
-	local hum = char:WaitForChild("Humanoid")
-	local hrp = char:WaitForChild("HumanoidRootPart")
-
-	-- Compute initial path
-	local success = pcall(path.ComputeAsync, path, hrp.Position, destPos)
-	
-	-- Fallback: If path failed due to water cost, reset water cost and compute standard route
-	if not success or path.Status ~= Enum.PathStatus.Success then
-		local fallbackPath = PathfindingService:CreatePath({
-			AgentRadius = 3,
-			AgentHeight = 6,
-			AgentCanJump = true
-		})
-		pcall(fallbackPath.ComputeAsync, fallbackPath, hrp.Position, destPos)
-		path = fallbackPath
-	end
-
-	local waypoints = path:GetWaypoints()
-	local totalWaypoints = #waypoints
-	if totalWaypoints == 0 then return end
-
-	for _, wp in ipairs(waypoints) do
-		createWaypointMarker(wp.Position, false)
-	end
-
-	local currentIndex = 1
-	local previousPosition = hrp.Position
-
-	while currentIndex <= totalWaypoints do
-		if hum.Health <= 0 then break end
-
-		local targetIndex = currentIndex
-
-		-- Lookahead Path Smoothing (Strictly skipped underwater)
-		for lookAhead = math.min(currentIndex + 3, totalWaypoints), currentIndex + 1, -1 do
-			local targetWP = waypoints[lookAhead]
-			if targetWP.Action ~= Enum.PathWaypointAction.Jump then
-				if hasLineOfSight(hrp.Position, targetWP.Position, char, hum) then
-					targetIndex = lookAhead
-					break
-				end
-			end
-		end
-
-		currentIndex = targetIndex
-		local currentWP = waypoints[currentIndex]
-
-		createWaypointMarker(currentWP.Position, true)
-		createPathLine(previousPosition, currentWP.Position)
-		previousPosition = currentWP.Position
-
-		-- Force jump if marked OR if submerged and target is above water surface
-		local isSwimming = hum:GetState() == Enum.HumanoidStateType.Swimming
-		if currentWP.Action == Enum.PathWaypointAction.Jump or (isSwimming and currentWP.Position.Y > hrp.Position.Y + 1) then
-			hum:ChangeState(Enum.HumanoidStateType.Jumping)
-		end
-
-		hum:MoveTo(currentWP.Position)
-
-		-- Distance check loop with unstick timeout
-		local startTime = os.clock()
-		local reachThreshold = isSwimming and 16 or 9 -- Relax threshold in water
-
-		while flatDistanceSq(hrp.Position, currentWP.Position) > reachThreshold do
-			if hum.Health <= 0 then
-				clearDebugVisuals()
-				return
-			end
-
-			-- Unstick trigger if stuck underwater against boat/wall for > 1.2 seconds
-			if os.clock() - startTime > 1.2 then
-				if isSwimming then
-					hum:ChangeState(Enum.HumanoidStateType.Jumping) -- Push upward out of water
-				end
-				break
-			end
-			task.wait(0.03)
-		end
-
-		currentIndex += 1
-	end
-
-	task.delay(3, clearDebugVisuals)
+for i, coords in ipairs(wp) do 
+    print("[DEBUG] Processing waypoint array index:", i)
+    walkto(Vector3.new(unpack(coords))) 
 end
 
--- Run navigation
-navigateWithVisuals(Vector3.new(2210, 27.5, -4170))
+print("[DEBUG] Script finished successfully.")
